@@ -49,17 +49,24 @@ type KiroStreamCallback struct {
 
 ### 2. handleToolUseEvent 增量触发（proxy/kiro.go）
 
-`toolUseState` 增加 `Started bool` 与 `EmittedDelta bool` 状态。逻辑：
+`toolUseState` 增加 `Started bool` 与 `EmittedDelta bool` 状态。
 
-- 首次确定 name+toolUseID 后，若设置了 `OnToolUseStart` 且尚未 Started → 触发 `OnToolUseStart(toolUseID, name)`，置 `Started=true`。
-- 收到 string 片段 `input`：照常 `InputBuffer.WriteString(input)`；**且**若设置了 `OnToolUseDelta` → 触发 `OnToolUseDelta(toolUseID, 片段)`，置 `EmittedDelta=true`。
+新增辅助函数 `startToolUseIfNeeded(state, callback)`：当 `state.Started` 为 false、`Name` 非空、`ToolUseID` 非空、设置了 `OnToolUseStart`，**且 `GeneratedID` 为 false** 时，触发一次 `OnToolUseStart(toolUseID, name)` 并置 `Started=true`。对 `GeneratedID` 工具（上游先给 name、后给真实 ID）刻意**不**在此触发，避免 Start 用到的临时 ID 与最终真实 ID 不一致——它们的 Start 推迟到 `finishToolUse` 兜底。
+
+`handleToolUseEvent` 处理 input 时：
+
+- 先调 `startToolUseIfNeeded`。
+- 收到 string 片段 `input`：照常 `InputBuffer.WriteString(input)`；**仅当 `OnToolUseDelta` 已设置且 `state.Started == true`** 时才触发 `OnToolUseDelta(toolUseID, 片段)` 并置 `EmittedDelta=true`。`Started == false` 时（即 GeneratedID 工具尚未 Start）**不发增量、不置 EmittedDelta**，留待兜底补发完整 partial_json，保证参数不丢且 Start 必先于 Delta。
 - 收到 map 快照形态 `input`（上游偶发，非字符串增量）：照常 `InputBuffer.Reset()` 重写 buffer；**不**逐片转发（无法安全增量），留待 stop 兜底。
 - `stop=true` → `finishToolUse`：
   - 解析完整 buffer 得到 `input` map。
-  - **兜底**：若设置了增量回调但 `EmittedDelta == false`（例如全程是 map 快照、或无任何 string 片段），则先补发一个 `OnToolUseDelta(toolUseID, 完整JSON)`，保证客户端拿到完整参数。
+  - **Start 兜底**：若设置了 `OnToolUseStart` 但 `Started == false`（GeneratedID 或 map 快照路径），先补发 `OnToolUseStart`，置 `Started=true`。
+  - **Delta 兜底**：若设置了 `OnToolUseDelta` 但 `EmittedDelta == false` 且 buffer 非空，补发一个 `OnToolUseDelta(toolUseID, 完整JSON)`，保证客户端拿到完整参数。
   - 触发 `OnToolUse(完整 KiroToolUse)`（记账/历史/最终内容，所有 handler 都用）。
 
 工具切换（当前工具未 stop 又来新工具）时，先对旧工具走完成流程（含上面的兜底与 OnToolUse），再开始新工具。
+
+**GeneratedID 工具的最终行为**：因 Start 与 Delta 都推迟到 `finishToolUse`，这类工具会以"Start + 单个完整 Delta + Stop"的形式发出（不是逐片增量，但参数完整、顺序正确，等同改动前的体验，不退化）。带显式 `toolUseId` 的工具（探针实测的真实上游形态）则正常逐片增量。
 
 ### 3. CallKiroAPI 名称还原扩展（proxy/kiro.go）
 
@@ -88,25 +95,29 @@ handler 内用局部变量在 Start 时记录当前工具的 idx/fcID，供 Delt
 
 ### 5. 边界与正确性
 
-- **map 快照降级**：协议仍正确（兜底补发完整 delta），体验等同今天，不退化。
-- **多工具调用**：每个工具独立 start/delta/stop 分段，index/fcID 不串。
+- **Start 必先于 Delta（关键不变量）**：handler 的 `OnToolUseDelta` 依赖 Start 已建立块上下文（Claude 的 `toolBlockIndex`、Responses 的 `curFcID`）。若 Delta 早于 Start 到达，Claude/Responses 会因守卫丢弃该 Delta、OpenAI 会发出无前导 start 的畸形块 → 工具参数丢失。因此 string 片段的 Delta 必须加 `state.Started` 守卫（见第 2 节）。
+- **GeneratedID 降级**：仅 name、无显式 toolUseId 的工具，Start/Delta 都推迟到 `finishToolUse`，以"Start + 单个完整 Delta + Stop"发出，参数完整不丢，不退化。
+- **map 快照降级**：协议仍正确（兜底补发完整 delta），体验等同改动前。
+- **多工具调用**：带显式 ID 的多工具各自独立 start/delta/stop 分段，index/fcID 不串；name 切换的多工具中第二个走 GeneratedID 降级路径。
 - **partial_json 合法性**：上游 string 片段拼接即完整 JSON，单个片段本身可能不是合法 JSON（这正是 input_json_delta 的设计——客户端累加后再解析），符合 Anthropic 协议。
 - **非流式与 apiTestAccount**：不设增量回调，走兼容路径，零行为变化。
 
 ## 测试
 
-`proxy/kiro_test.go` 增加：
+`proxy/kiro_test.go` 增加（实际实现）：
 
-- 增量模式：喂入多个 string 片段的 toolUseEvent + stop，断言回调顺序为 `OnToolUseStart` 一次 → 多个 `OnToolUseDelta`（片段与输入一致）→ `OnToolUse` 一次（完整 input），且 delta 拼接 == 完整 JSON。
-- 向后兼容：只设 `OnToolUse`（不设增量回调）时，行为与现状一致——只触发一次 `OnToolUse`，input 完整。
-- map 快照兜底：input 为 map 形态 + stop，断言增量模式下补发一个完整 `OnToolUseDelta` 后再 `OnToolUse`。
-- 多工具：连续两个工具（无显式 stop 切换 / 有 stop）各自 start/delta/stop 正确分段，ID 不混。
-- 现有 `TestParseEventStreamFinishesPendingToolUseOnEOF`、`TestParseEventStreamNilCallback*` 必须继续通过。
+- `TestHandleToolUseEventStreamsIncrementally`：喂入多个 string 片段的 toolUseEvent + stop，断言 `OnToolUseStart` 一次 → 多个 `OnToolUseDelta`（拼接 == 完整 JSON）→ `OnToolUse` 一次（完整 input）。
+- `TestHandleToolUseEventMapSnapshotFallsBackToSingleDelta`：input 为 map 形态 + stop，断言增量模式下补发**恰好一个**完整 `OnToolUseDelta` 后再 `OnToolUse`。
+- `TestHandleToolUseEventMultipleToolsWithExplicitIDsStreamEach`：两个带显式 ID 的工具连续调用，断言完整事件序列 `A start/delta/delta/use, B start/delta/delta/use`，两个工具都逐片增量、ID 不混。
+- `TestHandleToolUseEventMultipleToolsByNameSwitchStreamEach`：仅靠 name 变化切换的两个工具，断言第二个工具 Start 先于 Use。
+- `TestHandleToolUseEventStartPrecedesDeltaForGeneratedID`：GeneratedID 工具的严格顺序不变量——首个回调必须是 `OnToolUseStart` 而非 `OnToolUseDelta`。**此测试在评审阶段暴露了一个真实 bug**（早期实现中 GeneratedID 工具的 Delta 先于 Start 触发，导致 handler 丢弃 Delta、参数丢失），修复即第 2 节的 `state.Started` 守卫。
+- 现有 `TestParseEventStreamFinishesPendingToolUseOnEOF`、`TestParseEventStreamNilCallback*`、`TestHandleToolUseEventGeneratesMissingToolUseID`、`TestHandleToolUseEventReplacesGeneratedIDWhenRealIDArrives` 继续通过（向后兼容）。
 
 运行 `go build ./...`、`go test ./...`、`go vet ./...` 全绿。
 
 ## 改动面与风险
 
-- 修改：`proxy/kiro.go`（回调结构、handleToolUseEvent、finishToolUse、CallKiroAPI wrap）、`proxy/handler.go`（Claude+OpenAI 两个流式 handler 的 callback）、`proxy/responses_handler.go`（Responses 流式 handler 的 callback）。
+- 修改：`proxy/kiro.go`（回调结构、`toolUseState`、`handleToolUseEvent`、新增 `startToolUseIfNeeded`、`finishToolUse`、CallKiroAPI wrap）、`proxy/handler.go`（Claude+OpenAI 两个流式 handler 的 callback）、`proxy/responses_handler.go`（Responses 流式 handler 的 callback）、`proxy/kiro_test.go`（新增测试）。
 - 不涉及非流式路径。属于协议行为变更（工具参数由单块变多块增量），但映射到三个协议都自然，且对客户端是协议兼容的（客户端本就该累加 input_json_delta）。
 - 效果：大文件工具调用逐步实时出现，消除"静默等待后一次性弹出"。模型生成耗时与网络固有延迟不受影响（无法通过本改动消除）。
+- **评审修复**：实现并评审后发现 GeneratedID 工具的 Delta 早于 Start 触发会导致 handler 丢弃参数，已通过 `state.Started` 守卫修复（commit `b60e0f1`），并补充多工具与顺序不变量测试。

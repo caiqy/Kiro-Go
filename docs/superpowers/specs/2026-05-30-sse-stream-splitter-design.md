@@ -58,10 +58,12 @@ type streamTagSplitter struct {
     // 内部状态：buf / inThinking / dropThinking / thinkingStarted / eventThinkingOpen / source
 }
 
-func (s *streamTagSplitter) feed(text string, isThinking bool) // = 原 processX(text, isThinking, false)
-func (s *streamTagSplitter) flush()                            // = 原 processX("", false, true)
-func (s *streamTagSplitter) closeEventThinking()               // = 原 if eventThinkingOpen { emit("", 3) }
+func (s *streamTagSplitter) feed(text string, isThinking bool) // 处理一段上游文本（增量切分）
+func (s *streamTagSplitter) flush()                            // 流结束/工具调用前强制吐出残留
+func (s *streamTagSplitter) closeEventThinking()               // 关闭由 reasoning-event 打开的思考块
 ```
+
+`feed` 与 `flush` 内部都会先调用 `closeEventThinking()`（关闭可能打开的 reasoning 思考块），再做切分。`closeEventThinking` 仍作为独立方法暴露，但 handler 不需在 `flush()` 后单独调用它（见第 3 节）。
 
 保持不变并原样复用：
 - `thinkingStreamSource` / `allowTagSource` / `allowReasoningSource`（`proxy/handler.go:43-67`）。
@@ -74,19 +76,23 @@ func (s *streamTagSplitter) closeEventThinking()               // = 原 if event
 - `handleClaudeStream`：删除局部缓冲状态变量与 `processClaudeText` 定义，建 `streamTagSplitter{thinkingEnabled: thinking, emit: sendText}`。
   - `processClaudeText(text, isThinking, false)` → `splitter.feed(text, isThinking)`
   - `processClaudeText("", false, true)` → `splitter.flush()`（出现在 OnToolUse 与请求结束处）
-  - `proxy/handler.go:1215` 的 `if eventThinkingOpen { sendText("", 3) }` → `splitter.closeEventThinking()`
+  - 请求结束处原 `processX("", false, true)` 之后的 `if eventThinkingOpen { sendText("", 3) }` 直接删除——`flush()` 内部已先调 `closeEventThinking()`，无需在 handler 再单独调用。
 - `handleOpenAIStream`：同样改法，`emit: sendChunk`。
 
 注意 `sendText`/`sendChunk` 内部依赖各自闭包的 SSE 发送状态（如 `activeBlockIndex`、`responseStarted`），保持原样，仅作为 `emit` 注入。
 
 ## 测试
 
-新建 `proxy/stream_splitter_test.go`：
+新建 `proxy/stream_splitter_test.go`（实际实现）：
 
-- `tagPrefixSuffixLen` 单元用例：无 `<`、半截 `<thin`、半截 `</think`、完整标签、`<` 出现在中间等。
-- **即时下发回归**：feed 一段无标签短文本（< 50 字），断言**立即** emit 全部内容（旧逻辑会憋住）。直接验证 bug。
-- **跨 chunk 标签**：`"before<thin"` + `"king>secret</thinking>after"` 分两次喂入，断言正文/思考正确分离、标签被剥离。
-- **dropThinking 去重回归**：source 先被设为 reasoning-event 后，内联标签内容被丢弃但标签被正确剥离、正文不受影响。
+- `TestTagPrefixSuffixLen`：`tagPrefixSuffixLen` 单元用例（无 `<`、半截 `<thin`、半截 `</think`、完整标签、`<` 出现在中间等）。
+- `TestSplitterImmediatePlainText`：即时下发回归——feed 无标签短文本，断言**立即** emit 全部内容（旧逻辑会憋住）。直接验证 bug。
+- `TestSplitterHoldsPartialTagSuffix`：末尾出现可能是半截标签的 `<` 时保留尾巴、其余立即下发。
+- `TestSplitterCrossChunkOpenTag`：`"before<thin"` + `"king>secret</thinking>after"` 分两次喂入，断言正文/思考正确分离、标签被剥离。
+- `TestSplitterDropThinkingWhenReasoningSourceActive`：source 先被设为 reasoning-event 后，内联标签内容被丢弃但标签被正确剥离、正文不受影响。
+- `TestSplitterFlushClosesOpenReasoningBlock`：reasoning 思考块打开时调 `flush()`（如思考后紧跟工具调用），必须关闭该块（emit state 3）并复位状态。**此为评审修复**：早期 `flush()` 未关闭 reasoning 块，OnToolUse 路径会丢失思考块闭合。
+- `TestSplitterPreservesMultibyteUTF8`：逐字节喂入中文/emoji，断言正文逐字节无损（验证 byte 切分不破坏 UTF-8）。
+- `TestSplitterChunkBoundaryInvariance`：同一输入用一次性/逐 rune/每 3 rune 三种切法喂入，渲染成逻辑段后一致——证明重构唯一改变的是流式粒度。
 - 运行 `go test ./...` 确认现有测试（`handler_test.go`、`kiro_test.go`、`responses_handler_test.go` 等）不回归。
 
 ## 改动面与风险
@@ -94,3 +100,4 @@ func (s *streamTagSplitter) closeEventThinking()               // = 原 if event
 - 新增：`proxy/stream_splitter.go`、`proxy/stream_splitter_test.go`。
 - 修改：`proxy/handler.go` 的 `handleClaudeStream`、`handleOpenAIStream` 两个函数内部。
 - 净减重复代码。无对外行为变化（标签拆分语义不变），仅流式粒度变细、更流畅。
+- **评审修复（commit `39d23fa`）**：`flush()` 内部补调 `closeEventThinking()`，修复 reasoning 思考块在工具调用前未闭合的问题，并移除 handler 中 flush 后已成冗余的 `closeEventThinking()` 调用。

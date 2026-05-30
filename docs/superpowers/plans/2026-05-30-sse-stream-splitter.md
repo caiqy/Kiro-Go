@@ -29,9 +29,9 @@ emit 的 `state` 含义：`0`=正文文本，`1`=思考开始，`2`=思考续写
 3. 非思考文本：若 `eventThinkingOpen` 先 `emit("",3)` 并清 `eventThinkingOpen=false, thinkingStarted=false`。
 4. `buf += text`，进入循环切分（见下）。
 
-`flush()` 等价于原 `processX("", false, true)`：循环切分时 forceFlush 路径，把残留 buf 全部吐出并复位标签状态。
+`flush()`：先调 `closeEventThinking()` 关闭可能打开的 reasoning 思考块，再走循环切分的 forceFlush 路径，把残留 buf 全部吐出并复位标签状态。
 
-`closeEventThinking()` 等价于原流末尾的 `if eventThinkingOpen { emit("",3) }`：流结束后单独关闭 reasoning-event 引起的思考块（forceFlush 路径不处理 eventThinkingOpen，故需独立方法）。
+`closeEventThinking()`：若 `eventThinkingOpen` 则 `emit("",3)` 并复位状态。`feed`（非思考文本分支）与 `flush()` 内部都会调用它，handler 无需在 `flush()` 后单独调用（评审修复后的最终形态）。
 
 ### 切分循环（feed 用 force=false，flush 用 force=true）
 
@@ -298,6 +298,11 @@ func TestSplitterDropThinkingWhenReasoningSourceActive(t *testing.T) {
 
 文件顶部需 `import "strings"`（测试用到 `strings.Contains`）。若 `strings` 已导入则复用。
 
+> 实际实现中，除上述 4 个核心测试外，评审阶段又补充了 3 个：
+> `TestSplitterFlushClosesOpenReasoningBlock`（flush 必须关闭 reasoning 思考块，对应 flush 内部补调 closeEventThinking 的修复）、
+> `TestSplitterPreservesMultibyteUTF8`（byte 切分不破坏 UTF-8）、
+> `TestSplitterChunkBoundaryInvariance`（不同切法逻辑输出一致）。
+
 - [ ] **Step 2: 运行测试确认失败**
 
 Run: `go test ./proxy/ -run TestSplitter -v`
@@ -346,9 +351,7 @@ func (s *streamTagSplitter) feed(text string, isThinking bool) {
 	}
 
 	if s.eventThinkingOpen {
-		s.emit("", 3)
-		s.eventThinkingOpen = false
-		s.thinkingStarted = false
+		s.closeEventThinking()
 	}
 
 	s.buf += text
@@ -356,7 +359,10 @@ func (s *streamTagSplitter) feed(text string, isThinking bool) {
 }
 
 // flush 在流结束或工具调用前强制吐出残留 buffer。
+// 先关闭可能打开的 reasoning 思考块，再切分残留（评审修复：早期版本缺第一步，
+// 导致思考后紧跟工具调用时丢失思考块闭合）。
 func (s *streamTagSplitter) flush() {
+	s.closeEventThinking()
 	s.split(true)
 }
 
@@ -538,9 +544,10 @@ git commit -m "feat: add streamTagSplitter for low-latency SSE tag splitting"
 
 ```go
 		splitter.flush()
-		splitter.closeEventThinking()
 		closeActiveBlock()
 ```
+
+> `flush()` 内部已先调 `closeEventThinking()`，故无需在此单独调用（评审时移除了冗余调用）。原 `if eventThinkingOpen { sendText("", 3) }` 整段删除。
 
 - [ ] **Step 6: 编译确认无残留引用**
 
@@ -635,8 +642,9 @@ git commit -m "refactor: use streamTagSplitter in handleClaudeStream"
 
 ```go
 		splitter.flush()
-		splitter.closeEventThinking()
 ```
+
+> 同 Task 3：`flush()` 内部已含 `closeEventThinking()`，原 `if eventThinkingOpen { sendChunk("", 3) }` 整段删除，不在此单独调用。
 
 - [ ] **Step 6: 编译确认无残留引用**
 

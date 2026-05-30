@@ -146,7 +146,10 @@ type toolUseState struct {
 		startToolUseIfNeeded(current, callback)
 		if input, ok := event["input"].(string); ok {
 			current.InputBuffer.WriteString(input)
-			if input != "" && callback != nil && callback.OnToolUseDelta != nil {
+			// 仅在 Start 已触发后才发增量 delta。GeneratedID 工具的 Start 推迟到
+			// finishToolUse（避免临时 ID 与最终真实 ID 不一致），此时不发增量、也不置
+			// EmittedDelta，留待兜底补发完整 partial_json，保证参数不丢且顺序正确。
+			if input != "" && callback != nil && callback.OnToolUseDelta != nil && current.Started {
 				callback.OnToolUseDelta(current.ToolUseID, input)
 				current.EmittedDelta = true
 			}
@@ -158,6 +161,11 @@ type toolUseState struct {
 		}
 	}
 ```
+
+> **评审修复（commit `b60e0f1`）**：delta 触发条件里的 `&& current.Started` 是评审阶段补上的。
+> 早期实现缺这个守卫时，GeneratedID 工具（仅 name、无显式 toolUseId）的 delta 会先于
+> start 触发，导致 Claude/Responses handler 因块未建立而丢弃 delta、参数丢失。加守卫后，
+> 未 Start 的工具不发增量，由 finishToolUse 兜底补发完整 partial_json。
 
 - [ ] **Step 6: 新增 startToolUseIfNeeded 辅助函数**
 
@@ -625,6 +633,47 @@ Expected: 全部 PASS。
 
 Run: `go vet ./...`
 Expected: 无新增告警。
+
+---
+
+## Task 7: 评审修复 — 多工具测试与 Start/Delta 顺序守卫（实际补充）
+
+**背景:** 评审阶段补写 spec 计划里要求的多工具测试时，发现一个真实 bug：GeneratedID 工具（仅 name、无显式 toolUseId）的 `OnToolUseDelta` 会先于 `OnToolUseStart` 触发，使 Claude/Responses handler 因块未建立而丢弃 delta、工具参数丢失。
+
+**Files:**
+- Modify: `proxy/kiro.go`（`handleToolUseEvent` 的 string delta 分支）
+- Test: `proxy/kiro_test.go`
+
+- [ ] **Step 1: 补多工具与顺序测试（其中一个会暴露 bug）**
+
+向 `proxy/kiro_test.go` 追加三个测试：
+- `TestHandleToolUseEventMultipleToolsWithExplicitIDsStreamEach`：两个带显式 ID 的工具，断言完整序列 `A start/delta/delta/use, B start/delta/delta/use`。
+- `TestHandleToolUseEventMultipleToolsByNameSwitchStreamEach`：name 切换的两个工具，断言第二个工具 start 先于 use。
+- `TestHandleToolUseEventStartPrecedesDeltaForGeneratedID`：GeneratedID 工具首个回调必须是 start 而非 delta。
+
+- [ ] **Step 2: 运行确认 bug 暴露**
+
+Run: `go test ./proxy/ -run TestHandleToolUseEventStartPrecedesDeltaForGeneratedID -v`
+Expected: FAIL，实际回调顺序为 `[delta, delta, start]`
+
+- [ ] **Step 3: 加 state.Started 守卫修复**
+
+`handleToolUseEvent` 的 string delta 分支，触发条件加 `&& current.Started`（见 Task 1 Step 5 已更新的最终代码）。
+
+- [ ] **Step 4: 运行确认修复**
+
+Run: `go test ./proxy/ -run "TestHandleToolUseEvent|TestParseEventStream" -v`
+Expected: 全部 PASS（含 3 个新增多工具/顺序测试）
+
+- [ ] **Step 5: 全量验证 + 提交**
+
+Run: `go build ./... ; go test ./... ; go vet ./...`
+Expected: 全绿
+
+```bash
+git add proxy/kiro.go proxy/kiro_test.go
+git commit -m "fix: emit tool-use delta only after start to avoid dropped args for generated-ID tools"
+```
 
 ---
 
