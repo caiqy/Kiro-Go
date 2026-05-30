@@ -374,6 +374,7 @@ func (h *Handler) handleResponsesStream(
 			})
 		}
 
+		curFcID := ""
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
 				if text == "" {
@@ -394,7 +395,7 @@ func (h *Handler) handleResponsesStream(
 				})
 				responseStarted = true
 			},
-			OnToolUse: func(tu KiroToolUse) {
+			OnToolUseStart: func(toolUseID, name string) {
 				if messageStarted {
 					send("response.content_part.done", map[string]interface{}{
 						"type":          "response.content_part.done",
@@ -423,33 +424,40 @@ func (h *Handler) handleResponsesStream(
 					messageStarted = false
 					outputIndex++
 				}
-
-				toolUses = append(toolUses, tu)
-				args, _ := json.Marshal(tu.Input)
-				fcID := generateOutputItemID("fc")
+				curFcID = generateOutputItemID("fc")
 				send("response.output_item.added", map[string]interface{}{
 					"type":         "response.output_item.added",
 					"output_index": outputIndex,
 					"item": map[string]interface{}{
-						"id":        fcID,
+						"id":        curFcID,
 						"type":      "function_call",
 						"status":    "in_progress",
-						"call_id":   tu.ToolUseID,
-						"name":      tu.Name,
+						"call_id":   toolUseID,
+						"name":      name,
 						"arguments": "",
 					},
 				})
+				responseStarted = true
+			},
+			OnToolUseDelta: func(toolUseID, partialJSON string) {
+				if curFcID == "" {
+					return
+				}
 				send("response.function_call_arguments.delta", map[string]interface{}{
 					"type":         "response.function_call_arguments.delta",
-					"item_id":      fcID,
+					"item_id":      curFcID,
 					"output_index": outputIndex,
-					"delta":        string(args),
+					"delta":        partialJSON,
 				})
+			},
+			OnToolUse: func(tu KiroToolUse) {
+				toolUses = append(toolUses, tu)
+				args, _ := json.Marshal(tu.Input)
 				send("response.output_item.done", map[string]interface{}{
 					"type":         "response.output_item.done",
 					"output_index": outputIndex,
 					"item": map[string]interface{}{
-						"id":        fcID,
+						"id":        curFcID,
 						"type":      "function_call",
 						"status":    "completed",
 						"call_id":   tu.ToolUseID,
@@ -458,7 +466,7 @@ func (h *Handler) handleResponsesStream(
 					},
 				})
 				outputIndex++
-				responseStarted = true
+				curFcID = ""
 			},
 			OnComplete: func(inTok, outTok int) { inputTokens = inTok; outputTokens = outTok },
 			OnCredits:  func(c float64) { credits = c },
