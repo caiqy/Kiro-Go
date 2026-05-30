@@ -309,16 +309,28 @@ func CallKiroAPI(account *config.Account, payload *KiroPayload, callback *KiroSt
 		logger.Debugf("[KiroAPI] Request payload: %s", string(payloadJSON))
 	}
 
-	// Wrap OnToolUse to restore original tool names for the client.
-	if callback != nil && callback.OnToolUse != nil && len(payload.ToolNameMap) > 0 {
-		originalOnToolUse := callback.OnToolUse
+	// Wrap tool-use callbacks to restore original tool names for the client.
+	if callback != nil && len(payload.ToolNameMap) > 0 &&
+		(callback.OnToolUse != nil || callback.OnToolUseStart != nil) {
 		nameMap := payload.ToolNameMap
 		wrapped := *callback
-		wrapped.OnToolUse = func(tu KiroToolUse) {
-			if original, ok := nameMap[tu.Name]; ok {
-				tu.Name = original
+		if callback.OnToolUse != nil {
+			originalOnToolUse := callback.OnToolUse
+			wrapped.OnToolUse = func(tu KiroToolUse) {
+				if original, ok := nameMap[tu.Name]; ok {
+					tu.Name = original
+				}
+				originalOnToolUse(tu)
 			}
-			originalOnToolUse(tu)
+		}
+		if callback.OnToolUseStart != nil {
+			originalOnToolUseStart := callback.OnToolUseStart
+			wrapped.OnToolUseStart = func(id, name string) {
+				if original, ok := nameMap[name]; ok {
+					name = original
+				}
+				originalOnToolUseStart(id, name)
+			}
 		}
 		callback = &wrapped
 	}
