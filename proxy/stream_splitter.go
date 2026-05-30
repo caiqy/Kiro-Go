@@ -56,18 +56,16 @@ func (s *streamTagSplitter) feed(text string, isThinking bool) {
 		return
 	}
 
-	if s.eventThinkingOpen {
-		s.emit("", 3)
-		s.eventThinkingOpen = false
-		s.thinkingStarted = false
-	}
+	s.closeEventThinking()
 
 	s.buf += text
 	s.split(false)
 }
 
 // flush 在流结束或工具调用前强制吐出残留 buffer。
+// 等价于旧实现的 processX("", false, true)：先关闭可能打开的 reasoning 思考块，再切分残留。
 func (s *streamTagSplitter) flush() {
+	s.closeEventThinking()
 	s.split(true)
 }
 

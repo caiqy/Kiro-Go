@@ -131,3 +131,32 @@ func TestSplitterDropThinkingWhenReasoningSourceActive(t *testing.T) {
 		t.Fatalf("expected plain text \"XY\", got %q (all=%#v)", plain, got)
 	}
 }
+
+// flush 在 reasoning-event 思考块打开时（如 reasoning 后紧跟 tool call）必须关闭该块，
+// 等价于旧实现 processX("",false,true) 开头的 eventThinkingOpen 收尾逻辑。
+func TestSplitterFlushClosesOpenReasoningBlock(t *testing.T) {
+	s, rec := newRecSplitter(true)
+	s.feed("thinking...", true) // 打开 reasoning 思考块 (state 1)
+	s.flush()                   // 模拟 OnToolUse：思考后直接调工具
+	got := *rec
+	if len(got) == 0 {
+		t.Fatalf("expected emits, got none")
+	}
+	// 必须出现一次思考闭合 (state 3)
+	closed := false
+	for _, c := range got {
+		if c.state == 3 {
+			closed = true
+		}
+	}
+	if !closed {
+		t.Fatalf("expected thinking block to be closed (state 3) on flush, got %#v", got)
+	}
+	// 状态需复位：后续再来 reasoning 应以"开始"(state 1) 处理，而非"续写"(state 2)
+	s.feed("more", true)
+	got = *rec
+	last := got[len(got)-1]
+	if last != (emitCall{"more", 1}) {
+		t.Fatalf("expected reopened thinking to start at state 1, got %#v", last)
+	}
+}

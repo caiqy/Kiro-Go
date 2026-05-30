@@ -1104,7 +1104,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		splitter.flush()
-		splitter.closeEventThinking()
 		closeActiveBlock()
 
 		if realInputTokens > 0 {
@@ -1618,7 +1617,6 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 		}
 
 		splitter.flush()
-		splitter.closeEventThinking()
 
 		if realInputTokens > 0 {
 			inputTokens = realInputTokens
