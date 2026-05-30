@@ -1559,17 +1559,8 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 				}
 				splitter.feed(text, isThinking)
 			},
-			OnToolUse: func(tu KiroToolUse) {
+			OnToolUseStart: func(toolUseID, name string) {
 				splitter.flush()
-
-				args, _ := json.Marshal(tu.Input)
-				rawContentBuilder.WriteString(tu.Name)
-				rawContentBuilder.Write(args)
-				tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
-				tc.Function.Name = tu.Name
-				tc.Function.Arguments = string(args)
-				toolCalls = append(toolCalls, tc)
-
 				chunk := map[string]interface{}{
 					"id":      chatID,
 					"object":  "chat.completion.chunk",
@@ -1580,22 +1571,54 @@ func (h *Handler) handleOpenAIStream(w http.ResponseWriter, payload *KiroPayload
 						"delta": map[string]interface{}{
 							"tool_calls": []map[string]interface{}{{
 								"index": toolCallIndex,
-								"id":    tu.ToolUseID,
+								"id":    toolUseID,
 								"type":  "function",
 								"function": map[string]string{
-									"name":      tu.Name,
-									"arguments": string(args),
+									"name":      name,
+									"arguments": "",
 								},
 							}},
 						},
 						"finish_reason": nil,
 					}},
 				}
-				toolCallIndex++
 				data, _ := json.Marshal(chunk)
 				fmt.Fprintf(w, "data: %s\n\n", string(data))
 				flusher.Flush()
 				responseStarted = true
+			},
+			OnToolUseDelta: func(toolUseID, partialJSON string) {
+				chunk := map[string]interface{}{
+					"id":      chatID,
+					"object":  "chat.completion.chunk",
+					"created": time.Now().Unix(),
+					"model":   model,
+					"choices": []map[string]interface{}{{
+						"index": 0,
+						"delta": map[string]interface{}{
+							"tool_calls": []map[string]interface{}{{
+								"index": toolCallIndex,
+								"function": map[string]string{
+									"arguments": partialJSON,
+								},
+							}},
+						},
+						"finish_reason": nil,
+					}},
+				}
+				data, _ := json.Marshal(chunk)
+				fmt.Fprintf(w, "data: %s\n\n", string(data))
+				flusher.Flush()
+			},
+			OnToolUse: func(tu KiroToolUse) {
+				args, _ := json.Marshal(tu.Input)
+				rawContentBuilder.WriteString(tu.Name)
+				rawContentBuilder.Write(args)
+				tc := ToolCall{ID: tu.ToolUseID, Type: "function"}
+				tc.Function.Name = tu.Name
+				tc.Function.Arguments = string(args)
+				toolCalls = append(toolCalls, tc)
+				toolCallIndex++
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
