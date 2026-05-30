@@ -331,3 +331,108 @@ func TestHandleToolUseEventMapSnapshotFallsBackToSingleDelta(t *testing.T) {
 		t.Fatalf("unexpected final tool use: %#v", toolUses)
 	}
 }
+
+// 多工具（每个事件带显式 toolUseId）：两个工具都应在各自第一个片段时触发 Start，
+// 即第二个工具的 Start 必须发生在它的 stop 之前（不退化为非流式）。
+type toolEvt struct {
+	kind string // "start" | "delta" | "use"
+	id   string
+}
+
+func TestHandleToolUseEventMultipleToolsWithExplicitIDsStreamEach(t *testing.T) {
+	var seq []toolEvt
+	cb := &KiroStreamCallback{
+		OnToolUseStart: func(id, name string) { seq = append(seq, toolEvt{"start", id}) },
+		OnToolUseDelta: func(id, pj string) { seq = append(seq, toolEvt{"delta", id}) },
+		OnToolUse:      func(tu KiroToolUse) { seq = append(seq, toolEvt{"use", tu.ToolUseID}) },
+	}
+
+	var cur *toolUseState
+	// tool A
+	cur = handleToolUseEvent(map[string]interface{}{"toolUseId": "A", "name": "fa", "input": `{"x":`}, cur, cb)
+	cur = handleToolUseEvent(map[string]interface{}{"toolUseId": "A", "input": `1}`, "stop": true}, cur, cb)
+	// tool B
+	cur = handleToolUseEvent(map[string]interface{}{"toolUseId": "B", "name": "fb", "input": `{"y":`}, cur, cb)
+	cur = handleToolUseEvent(map[string]interface{}{"toolUseId": "B", "input": `2}`, "stop": true}, cur, cb)
+
+	// 期望顺序：A start, A delta, A delta, A use, B start, B delta, B delta, B use
+	want := []toolEvt{
+		{"start", "A"}, {"delta", "A"}, {"delta", "A"}, {"use", "A"},
+		{"start", "B"}, {"delta", "B"}, {"delta", "B"}, {"use", "B"},
+	}
+	if len(seq) != len(want) {
+		t.Fatalf("event count mismatch: got %d want %d (%#v)", len(seq), len(want), seq)
+	}
+	for i := range want {
+		if seq[i] != want[i] {
+			t.Fatalf("at %d: got %+v want %+v (full=%#v)", i, seq[i], want[i], seq)
+		}
+	}
+}
+
+// 多工具（仅靠 name 变化切换，无显式 toolUseId）：第二个工具走 GeneratedID 分支。
+// 验证第二个工具仍能在 stop 前增量发送（Start 在第一个片段时，而非退化到 stop 才一次性发）。
+func TestHandleToolUseEventMultipleToolsByNameSwitchStreamEach(t *testing.T) {
+	var seq []string // "start:<name>" | "delta" | "use:<name>"
+	cb := &KiroStreamCallback{
+		OnToolUseStart: func(id, name string) { seq = append(seq, "start:"+name) },
+		OnToolUseDelta: func(id, pj string) { seq = append(seq, "delta") },
+		OnToolUse:      func(tu KiroToolUse) { seq = append(seq, "use:"+tu.Name) },
+	}
+
+	var cur *toolUseState
+	// tool fa (name only)
+	cur = handleToolUseEvent(map[string]interface{}{"name": "fa", "input": `{"x":`}, cur, cb)
+	cur = handleToolUseEvent(map[string]interface{}{"input": `1}`}, cur, cb)
+	// switch to fb by name change (no stop on fa)
+	cur = handleToolUseEvent(map[string]interface{}{"name": "fb", "input": `{"y":`}, cur, cb)
+	cur = handleToolUseEvent(map[string]interface{}{"input": `2}`, "stop": true}, cur, cb)
+
+	// 第二个工具 fb 的 start 必须出现在它的 use 之前（即不退化为一次性）。
+	startFbIdx, useFbIdx := -1, -1
+	for i, e := range seq {
+		if e == "start:fb" && startFbIdx < 0 {
+			startFbIdx = i
+		}
+		if e == "use:fb" && useFbIdx < 0 {
+			useFbIdx = i
+		}
+	}
+	if startFbIdx < 0 {
+		t.Fatalf("fb never emitted start: %#v", seq)
+	}
+	if useFbIdx < 0 {
+		t.Fatalf("fb never emitted use: %#v", seq)
+	}
+	// 关键断言：fb 的 start 与 use 之间应至少有一个 delta（增量），且 start 在 use 前。
+	if startFbIdx >= useFbIdx {
+		t.Fatalf("fb start should precede use, got start@%d use@%d: %#v", startFbIdx, useFbIdx, seq)
+	}
+}
+
+// 协议不变量：对每个工具，OnToolUseStart 必须先于该工具的任何 OnToolUseDelta。
+// 否则 handler 收到 delta 时块尚未开始（toolBlockIndex<0 / curFcID==""），delta 被丢弃，
+// 导致工具参数丢失。本测试覆盖 GeneratedID（仅 name、无显式 toolUseId）路径。
+func TestHandleToolUseEventStartPrecedesDeltaForGeneratedID(t *testing.T) {
+	var seq []string // "start" | "delta"
+	cb := &KiroStreamCallback{
+		OnToolUseStart: func(id, name string) { seq = append(seq, "start") },
+		OnToolUseDelta: func(id, pj string) { seq = append(seq, "delta") },
+		OnToolUse:      func(tu KiroToolUse) {},
+	}
+
+	var cur *toolUseState
+	cur = handleToolUseEvent(map[string]interface{}{"name": "fa", "input": `{"x":`}, cur, cb)
+	cur = handleToolUseEvent(map[string]interface{}{"input": `1}`, "stop": true}, cur, cb)
+
+	if len(seq) == 0 {
+		t.Fatalf("expected events")
+	}
+	// 第一个事件必须是 start，不能是 delta。
+	if seq[0] != "start" {
+		t.Fatalf("OnToolUseStart must precede any OnToolUseDelta, got order: %#v", seq)
+	}
+}
+
+
+

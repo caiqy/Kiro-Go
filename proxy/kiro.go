@@ -715,7 +715,10 @@ func handleToolUseEvent(event map[string]interface{}, current *toolUseState, cal
 		startToolUseIfNeeded(current, callback)
 		if input, ok := event["input"].(string); ok {
 			current.InputBuffer.WriteString(input)
-			if input != "" && callback != nil && callback.OnToolUseDelta != nil {
+			// 仅在 Start 已触发后才发增量 delta。GeneratedID 工具的 Start 推迟到
+			// finishToolUse（避免临时 ID 与最终真实 ID 不一致），此时不发增量、也不置
+			// EmittedDelta，留待兜底补发完整 partial_json，保证参数不丢且顺序正确。
+			if input != "" && callback != nil && callback.OnToolUseDelta != nil && current.Started {
 				callback.OnToolUseDelta(current.ToolUseID, input)
 				current.EmittedDelta = true
 			}
