@@ -1022,6 +1022,7 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			thinkingEnabled: thinking,
 			emit:            sendText,
 		}
+		toolBlockIndex := -1
 
 		callback := &KiroStreamCallback{
 			OnText: func(text string, isThinking bool) {
@@ -1035,45 +1036,49 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				}
 				splitter.feed(text, isThinking)
 			},
-			OnToolUse: func(tu KiroToolUse) {
+			OnToolUseStart: func(toolUseID, name string) {
 				splitter.flush()
+				ensureMessageStart()
+				closeActiveBlock()
+				toolBlockIndex = nextContentIndex
+				nextContentIndex++
+				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
+					"type":  "content_block_start",
+					"index": toolBlockIndex,
+					"content_block": map[string]interface{}{
+						"type":  "tool_use",
+						"id":    toolUseID,
+						"name":  name,
+						"input": map[string]interface{}{},
+					},
+				})
+			},
+			OnToolUseDelta: func(toolUseID, partialJSON string) {
+				if toolBlockIndex < 0 {
+					return
+				}
+				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": toolBlockIndex,
+					"delta": map[string]interface{}{
+						"type":         "input_json_delta",
+						"partial_json": partialJSON,
+					},
+				})
+			},
+			OnToolUse: func(tu KiroToolUse) {
 				rawContentBuilder.WriteString(tu.Name)
 				if b, err := json.Marshal(tu.Input); err == nil {
 					rawContentBuilder.Write(b)
 				}
-
 				toolUses = append(toolUses, tu)
-				ensureMessageStart()
-				closeActiveBlock()
-
-				idx := nextContentIndex
-				nextContentIndex++
-
-				h.sendSSE(w, flusher, "content_block_start", map[string]interface{}{
-					"type":  "content_block_start",
-					"index": idx,
-					"content_block": map[string]interface{}{
-						"type":  "tool_use",
-						"id":    tu.ToolUseID,
-						"name":  tu.Name,
-						"input": map[string]interface{}{},
-					},
-				})
-
-				inputJSON, _ := json.Marshal(tu.Input)
-				h.sendSSE(w, flusher, "content_block_delta", map[string]interface{}{
-					"type":  "content_block_delta",
-					"index": idx,
-					"delta": map[string]interface{}{
-						"type":         "input_json_delta",
-						"partial_json": string(inputJSON),
-					},
-				})
-
-				h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
-					"type":  "content_block_stop",
-					"index": idx,
-				})
+				if toolBlockIndex >= 0 {
+					h.sendSSE(w, flusher, "content_block_stop", map[string]interface{}{
+						"type":  "content_block_stop",
+						"index": toolBlockIndex,
+					})
+					toolBlockIndex = -1
+				}
 			},
 			OnComplete: func(inTok, outTok int) {
 				inputTokens = inTok
