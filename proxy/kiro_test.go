@@ -269,3 +269,65 @@ func awsEventStreamFrame(t *testing.T, eventType string, payload map[string]inte
 	frame = append(frame, 0, 0, 0, 0)
 	return frame
 }
+
+func TestHandleToolUseEventStreamsIncrementally(t *testing.T) {
+	var startCalls []string
+	var deltas []string
+	var toolUses []KiroToolUse
+	cb := &KiroStreamCallback{
+		OnToolUseStart: func(id, name string) { startCalls = append(startCalls, id+"|"+name) },
+		OnToolUseDelta: func(id, pj string) { deltas = append(deltas, pj) },
+		OnToolUse:      func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+	}
+
+	cur := handleToolUseEvent(map[string]interface{}{
+		"toolUseId": "toolu_1", "name": "write_file", "input": `{"path":`,
+	}, nil, cb)
+	cur = handleToolUseEvent(map[string]interface{}{
+		"toolUseId": "toolu_1", "input": `"a.txt",`,
+	}, cur, cb)
+	cur = handleToolUseEvent(map[string]interface{}{
+		"toolUseId": "toolu_1", "input": `"content":"hi"}`, "stop": true,
+	}, cur, cb)
+
+	if cur != nil {
+		t.Fatalf("expected nil after stop")
+	}
+	if len(startCalls) != 1 || startCalls[0] != "toolu_1|write_file" {
+		t.Fatalf("expected one start for toolu_1|write_file, got %#v", startCalls)
+	}
+	joined := ""
+	for _, d := range deltas {
+		joined += d
+	}
+	if joined != `{"path":"a.txt","content":"hi"}` {
+		t.Fatalf("delta join mismatch: %q", joined)
+	}
+	if len(toolUses) != 1 || toolUses[0].Input["path"] != "a.txt" || toolUses[0].Input["content"] != "hi" {
+		t.Fatalf("unexpected final tool use: %#v", toolUses)
+	}
+}
+
+func TestHandleToolUseEventMapSnapshotFallsBackToSingleDelta(t *testing.T) {
+	var deltas []string
+	var toolUses []KiroToolUse
+	cb := &KiroStreamCallback{
+		OnToolUseStart: func(id, name string) {},
+		OnToolUseDelta: func(id, pj string) { deltas = append(deltas, pj) },
+		OnToolUse:      func(tu KiroToolUse) { toolUses = append(toolUses, tu) },
+	}
+	cur := handleToolUseEvent(map[string]interface{}{
+		"toolUseId": "toolu_2", "name": "write_file",
+		"input": map[string]interface{}{"path": "b.txt"},
+		"stop":  true,
+	}, nil, cb)
+	if cur != nil {
+		t.Fatalf("expected nil after stop")
+	}
+	if len(deltas) != 1 {
+		t.Fatalf("expected exactly one fallback delta, got %d (%#v)", len(deltas), deltas)
+	}
+	if len(toolUses) != 1 || toolUses[0].Input["path"] != "b.txt" {
+		t.Fatalf("unexpected final tool use: %#v", toolUses)
+	}
+}

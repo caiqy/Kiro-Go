@@ -233,6 +233,8 @@ type InferenceConfig struct {
 // KiroStreamCallback stream response callbacks
 type KiroStreamCallback struct {
 	OnText         func(text string, isThinking bool)
+	OnToolUseStart func(toolUseID, name string)
+	OnToolUseDelta func(toolUseID, partialJSON string)
 	OnToolUse      func(toolUse KiroToolUse)
 	OnComplete     func(inputTokens, outputTokens int)
 	OnError        func(err error)
@@ -665,10 +667,12 @@ func readTokenNumber(m map[string]interface{}, keys ...string) (int, bool) {
 // ==================== Tool Use Handling ====================
 
 type toolUseState struct {
-	ToolUseID   string
-	Name        string
-	InputBuffer strings.Builder
-	GeneratedID bool
+	ToolUseID    string
+	Name         string
+	InputBuffer  strings.Builder
+	GeneratedID  bool
+	Started      bool
+	EmittedDelta bool
 }
 
 func handleToolUseEvent(event map[string]interface{}, current *toolUseState, callback *KiroStreamCallback) *toolUseState {
@@ -696,12 +700,18 @@ func handleToolUseEvent(event map[string]interface{}, current *toolUseState, cal
 	}
 
 	if current != nil {
+		startToolUseIfNeeded(current, callback)
 		if input, ok := event["input"].(string); ok {
 			current.InputBuffer.WriteString(input)
+			if input != "" && callback != nil && callback.OnToolUseDelta != nil {
+				callback.OnToolUseDelta(current.ToolUseID, input)
+				current.EmittedDelta = true
+			}
 		} else if inputObj, ok := event["input"].(map[string]interface{}); ok {
 			data, _ := json.Marshal(inputObj)
 			current.InputBuffer.Reset()
 			current.InputBuffer.Write(data)
+			// map 快照无法安全逐片转发，留待 finishToolUse 兜底补发完整 delta
 		}
 	}
 
@@ -713,8 +723,25 @@ func handleToolUseEvent(event map[string]interface{}, current *toolUseState, cal
 	return current
 }
 
+// startToolUseIfNeeded 在工具具备稳定 ID 后触发一次 OnToolUseStart。
+// 对 GeneratedID（上游先给 name 后给真实 ID）的工具不在此触发，
+// 留待 finishToolUse 兜底，避免 start 用到的临时 ID 与最终 ID 不一致。
+func startToolUseIfNeeded(state *toolUseState, callback *KiroStreamCallback) {
+	if state == nil || state.Started || state.Name == "" || state.GeneratedID {
+		return
+	}
+	if callback == nil || callback.OnToolUseStart == nil {
+		return
+	}
+	if state.ToolUseID == "" {
+		return
+	}
+	callback.OnToolUseStart(state.ToolUseID, state.Name)
+	state.Started = true
+}
+
 func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
-	if state == nil || state.Name == "" || callback == nil || callback.OnToolUse == nil {
+	if state == nil || state.Name == "" || callback == nil {
 		return
 	}
 	if state.ToolUseID == "" {
@@ -727,11 +754,25 @@ func finishToolUse(state *toolUseState, callback *KiroStreamCallback) {
 	if input == nil {
 		input = make(map[string]interface{})
 	}
-	callback.OnToolUse(KiroToolUse{
-		ToolUseID: state.ToolUseID,
-		Name:      state.Name,
-		Input:     input,
-	})
+
+	// 增量模式兜底：若启用了增量回调但尚未 Start（如 GeneratedID 或 map 快照），补 Start。
+	if callback.OnToolUseStart != nil && !state.Started {
+		callback.OnToolUseStart(state.ToolUseID, state.Name)
+		state.Started = true
+	}
+	// 若启用了增量回调但从未发过 delta，补发一个完整 partial_json，保证客户端拿到完整参数。
+	if callback.OnToolUseDelta != nil && !state.EmittedDelta && state.InputBuffer.Len() > 0 {
+		callback.OnToolUseDelta(state.ToolUseID, state.InputBuffer.String())
+		state.EmittedDelta = true
+	}
+
+	if callback.OnToolUse != nil {
+		callback.OnToolUse(KiroToolUse{
+			ToolUseID: state.ToolUseID,
+			Name:      state.Name,
+			Input:     input,
+		})
+	}
 }
 
 func firstStringField(m map[string]interface{}, keys ...string) string {
