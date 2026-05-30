@@ -160,3 +160,129 @@ func TestSplitterFlushClosesOpenReasoningBlock(t *testing.T) {
 		t.Fatalf("expected reopened thinking to start at state 1, got %#v", last)
 	}
 }
+
+// 副作用核对：byte 切分下，UTF-8 多字节字符不得被切坏。
+// 跨 chunk 喂入含中文/emoji 的文本，拼回的正文必须与原文逐字节相同（无乱码、无丢字）。
+func TestSplitterPreservesMultibyteUTF8(t *testing.T) {
+	const full = "你好世界🌍这是一段中文测试abc"
+	// 逐字节喂入（最极端的切分，会把每个多字节字符拆散到多个 chunk）
+	s, rec := newRecSplitter(false)
+	for i := 0; i < len(full); i++ {
+		s.feed(full[i:i+1], false)
+	}
+	s.flush()
+	var assembled string
+	for _, c := range *rec {
+		if c.state == 0 {
+			assembled += c.text
+		}
+	}
+	if assembled != full {
+		t.Fatalf("UTF-8 corrupted: got %q, want %q", assembled, full)
+	}
+}
+
+// 副作用核对：chunk 边界无关性。
+// 同一输入用不同切法喂入，渲染成逻辑段（正文段 / 思考块，按内容拼接）后必须一致。
+// state1/state2 的分界是 chunk 粒度决定的（新旧代码皆然，消费端 state1 发开标记+文本、
+// state2 仅发文本，拼接后渲染相同），故归一化时把同一思考块的 state1/2/3 折叠为一个块。
+// 这证明本次重构唯一改变的是流式粒度，不改变正文内容、思考内容与块边界归属。
+func TestSplitterChunkBoundaryInvariance(t *testing.T) {
+	inputs := []string{
+		"plain text only no tags",
+		"before<thinking>inner thoughts</thinking>after",
+		"a<thinking>t1</thinking>b<thinking>t2</thinking>c",
+		"text with a lone < bracket and more",
+		"trailing partial <thin",
+		"<thinking>only thinking no close",
+		"你好<thinking>思考内容</thinking>世界",
+	}
+
+	type seg struct {
+		kind string // "body" 或 "think"
+		text string
+	}
+
+	// render：把 emit 序列折叠为逻辑段，消除 state1/state2 的 chunk 粒度差异。
+	render := func(calls []emitCall) []seg {
+		var out []seg
+		appendTo := func(kind, text string) {
+			if len(out) > 0 && out[len(out)-1].kind == kind {
+				out[len(out)-1].text += text
+			} else {
+				out = append(out, seg{kind, text})
+			}
+		}
+		for _, c := range calls {
+			switch c.state {
+			case 0:
+				if c.text != "" {
+					appendTo("body", c.text)
+				}
+			case 1:
+				out = append(out, seg{"think", c.text}) // 块开始：总是起新块
+			case 2:
+				if c.text != "" {
+					appendTo("think", c.text)
+				}
+			case 3:
+				if c.text != "" {
+					appendTo("think", c.text)
+				}
+			}
+		}
+		return out
+	}
+
+	feedAllAtOnce := func(in string) []seg {
+		s, rec := newRecSplitter(true)
+		s.feed(in, false)
+		s.flush()
+		return render(*rec)
+	}
+
+	feedByRunes := func(in string) []seg {
+		s, rec := newRecSplitter(true)
+		for _, r := range in {
+			s.feed(string(r), false)
+		}
+		s.flush()
+		return render(*rec)
+	}
+
+	feedByChunks := func(in string, size int) []seg {
+		s, rec := newRecSplitter(true)
+		runes := []rune(in)
+		for i := 0; i < len(runes); i += size {
+			end := i + size
+			if end > len(runes) {
+				end = len(runes)
+			}
+			s.feed(string(runes[i:end]), false)
+		}
+		s.flush()
+		return render(*rec)
+	}
+
+	equal := func(a, b []seg) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	for _, in := range inputs {
+		ref := feedAllAtOnce(in)
+		if got := feedByRunes(in); !equal(ref, got) {
+			t.Fatalf("rune-by-rune differs for %q:\n once=%#v\n rune=%#v", in, ref, got)
+		}
+		if got := feedByChunks(in, 3); !equal(ref, got) {
+			t.Fatalf("3-rune-chunk differs for %q:\n once=%#v\n chunk=%#v", in, ref, got)
+		}
+	}
+}
