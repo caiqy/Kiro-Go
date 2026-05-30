@@ -13,8 +13,10 @@
 .idea/
 .vscode/
 .claude/
+.codegraph/
 .DS_Store
 Thumbs.db
+opencode.json
 
 # Zeabur local CLI context (contains personal project/service IDs)
 .zeabur/
