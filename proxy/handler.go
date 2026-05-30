@@ -936,13 +936,6 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			activeBlockType = blockType
 		}
 
-		var textBuffer string
-		var inThinkingBlock bool
-		var dropTagThinking bool
-		var thinkingSource thinkingStreamSource
-		var thinkingStarted bool
-		var eventThinkingOpen bool
-
 		sendText := func(text string, thinkingState int) {
 			if thinkingState == 0 {
 				if text == "" {
@@ -1025,110 +1018,9 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			}
 		}
 
-		processClaudeText := func(text string, isThinking bool, forceFlush bool) {
-			if isThinking && !thinking {
-				return
-			}
-
-			if isThinking {
-				if !allowReasoningSource(&thinkingSource) {
-					return
-				}
-				if !thinkingStarted {
-					sendText(text, 1)
-					thinkingStarted = true
-					eventThinkingOpen = true
-				} else {
-					sendText(text, 2)
-				}
-				return
-			}
-
-			if eventThinkingOpen {
-				sendText("", 3)
-				eventThinkingOpen = false
-				thinkingStarted = false
-			}
-
-			textBuffer += text
-
-			for {
-				if !inThinkingBlock {
-					thinkingStart := strings.Index(textBuffer, "<thinking>")
-					if thinkingStart != -1 {
-						if thinkingStart > 0 {
-							sendText(textBuffer[:thinkingStart], 0)
-						}
-						textBuffer = textBuffer[thinkingStart+10:]
-						inThinkingBlock = true
-						dropTagThinking = !allowTagSource(&thinkingSource)
-						thinkingStarted = false
-					} else if forceFlush || len([]rune(textBuffer)) > 50 {
-						runes := []rune(textBuffer)
-						safeLen := len(runes)
-						if !forceFlush {
-							safeLen = max(0, len(runes)-15)
-						}
-						if safeLen > 0 {
-							sendText(string(runes[:safeLen]), 0)
-							textBuffer = string(runes[safeLen:])
-						}
-						break
-					} else {
-						break
-					}
-				} else {
-					thinkingEnd := strings.Index(textBuffer, "</thinking>")
-					if thinkingEnd != -1 {
-						content := textBuffer[:thinkingEnd]
-						if !dropTagThinking {
-							if !thinkingStarted {
-								sendText(content, 1)
-								sendText("", 3)
-							} else {
-								sendText(content, 3)
-							}
-						}
-						textBuffer = textBuffer[thinkingEnd+11:]
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-					} else if forceFlush {
-						if textBuffer != "" {
-							if !dropTagThinking {
-								if !thinkingStarted {
-									sendText(textBuffer, 1)
-									sendText("", 3)
-								} else {
-									sendText(textBuffer, 3)
-								}
-							}
-							textBuffer = ""
-						}
-						inThinkingBlock = false
-						dropTagThinking = false
-						thinkingStarted = false
-						break
-					} else {
-						runes := []rune(textBuffer)
-						if len(runes) > 20 {
-							safeLen := len(runes) - 15
-							if safeLen > 0 {
-								if !dropTagThinking {
-									if !thinkingStarted {
-										sendText(string(runes[:safeLen]), 1)
-										thinkingStarted = true
-									} else {
-										sendText(string(runes[:safeLen]), 2)
-									}
-								}
-								textBuffer = string(runes[safeLen:])
-							}
-						}
-						break
-					}
-				}
-			}
+		splitter := &streamTagSplitter{
+			thinkingEnabled: thinking,
+			emit:            sendText,
 		}
 
 		callback := &KiroStreamCallback{
@@ -1141,10 +1033,10 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 				} else {
 					rawContentBuilder.WriteString(text)
 				}
-				processClaudeText(text, isThinking, false)
+				splitter.feed(text, isThinking)
 			},
 			OnToolUse: func(tu KiroToolUse) {
-				processClaudeText("", false, true)
+				splitter.flush()
 				rawContentBuilder.WriteString(tu.Name)
 				if b, err := json.Marshal(tu.Input); err == nil {
 					rawContentBuilder.Write(b)
@@ -1211,10 +1103,8 @@ func (h *Handler) handleClaudeStream(w http.ResponseWriter, payload *KiroPayload
 			return
 		}
 
-		processClaudeText("", false, true)
-		if eventThinkingOpen {
-			sendText("", 3)
-		}
+		splitter.flush()
+		splitter.closeEventThinking()
 		closeActiveBlock()
 
 		if realInputTokens > 0 {
