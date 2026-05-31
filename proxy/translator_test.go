@@ -446,6 +446,232 @@ func TestParseModelAndThinking(t *testing.T) {
 	}
 }
 
+func TestTrimLeadingAssistantHistoryDropsOrphanedToolResults(t *testing.T) {
+	// When conversation starts with assistant(tool_use) -> user(tool_result),
+	// trimLeadingAssistantHistory should drop both, not just the assistant.
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "call_1", "name": "grep", "input": map[string]interface{}{"pattern": "foo"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "call_1", "content": "found: foo bar"},
+			}},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "call_2", "name": "read", "input": map[string]interface{}{"filePath": "/tmp/x"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "call_2", "content": "file contents"},
+			}},
+			{Role: "assistant", Content: "Done analyzing."},
+			{Role: "user", Content: "Now summarize."},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	// The first 4 messages (2x assistant tool_use + 2x user tool_result) should be trimmed.
+	// Remaining: assistant("Done analyzing.") + user("Now summarize.") as current.
+	// After system priming prepend: priming_user + priming_assistant + assistant("Done...")
+	// Current: "Now summarize."
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if !strings.Contains(cur.Content, "Now summarize") {
+		t.Fatalf("expected current message to be 'Now summarize', got %q", cur.Content)
+	}
+
+	// History should NOT contain any orphaned tool_result messages
+	for i, msg := range payload.ConversationState.History {
+		if msg.UserInputMessage != nil && msg.UserInputMessage.UserInputMessageContext != nil {
+			if len(msg.UserInputMessage.UserInputMessageContext.ToolResults) > 0 {
+				t.Fatalf("history[%d] still contains structured toolResults, should have been trimmed", i)
+			}
+		}
+	}
+}
+
+func TestTrimLeadingAssistantHistoryStopsAtUserWithText(t *testing.T) {
+	// If the first user message has both text and tool_result, it should NOT be trimmed.
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "call_1", "name": "bash", "input": map[string]interface{}{"command": "ls"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "call_1", "content": "file1.txt"},
+				map[string]interface{}{"type": "text", "text": "I see the file, now continue."},
+			}},
+			{Role: "assistant", Content: "OK."},
+			{Role: "user", Content: "Summarize."},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	// The leading assistant is trimmed, but the user with text+tool_result is kept.
+	// After priming: priming_user + priming_assistant + user(text+tool_result) + assistant("OK.")
+	// Current: "Summarize."
+	cur := payload.ConversationState.CurrentMessage.UserInputMessage
+	if !strings.Contains(cur.Content, "Summarize") {
+		t.Fatalf("expected current to be 'Summarize', got %q", cur.Content)
+	}
+
+	// The user message with text should be preserved in history
+	found := false
+	for _, msg := range payload.ConversationState.History {
+		if msg.UserInputMessage != nil && strings.Contains(msg.UserInputMessage.Content, "I see the file") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected user message with text to be preserved in history")
+	}
+}
+
+func TestCollectHistoryToolsAutoDeclaresWhenNoToolsProvided(t *testing.T) {
+	// Simulates a compact request: tools=[] but history has tool_use structures.
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Build a feature"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "I'll read the file."},
+				map[string]interface{}{"type": "tool_use", "id": "call_1", "name": "read", "input": map[string]interface{}{"filePath": "/tmp/x"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "call_1", "content": "file contents"},
+			}},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "text", "text": "Now editing."},
+				map[string]interface{}{"type": "tool_use", "id": "call_2", "name": "apply_patch", "input": map[string]interface{}{"patchText": "..."}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "call_2", "content": "patched"},
+			}},
+			{Role: "assistant", Content: "All done."},
+			{Role: "user", Content: "Update the anchored summary."},
+		},
+		Tools: nil, // No tools declared (compact request)
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	// Tools should be auto-declared from history
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.Tools) == 0 {
+		t.Fatalf("expected auto-declared tools in current message context, got nil or empty")
+	}
+
+	// Should have found "read" and "apply_patch" (sanitized to "applyPatch")
+	toolNames := make(map[string]bool)
+	for _, tool := range ctx.Tools {
+		toolNames[tool.ToolSpecification.Name] = true
+	}
+	// "read" stays as "read", "apply_patch" becomes "applyPatch"
+	if !toolNames["read"] {
+		t.Fatalf("expected 'read' in auto-declared tools, got %v", toolNames)
+	}
+	if !toolNames["applyPatch"] {
+		t.Fatalf("expected 'applyPatch' (sanitized from apply_patch) in auto-declared tools, got %v", toolNames)
+	}
+}
+
+func TestCollectHistoryToolsNotCalledWhenToolsProvided(t *testing.T) {
+	// Normal agentic request: tools are provided, collectHistoryTools should NOT run.
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Run ls"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "call_1", "name": "bash", "input": map[string]interface{}{"command": "ls"}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "call_1", "content": "file1.txt"},
+			}},
+		},
+		Tools: []ClaudeTool{
+			{Name: "bash", Description: "Run a bash command", InputSchema: map[string]interface{}{"type": "object"}},
+		},
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.Tools) == 0 {
+		t.Fatalf("expected tools in context")
+	}
+
+	// Should only have the explicitly declared "bash" tool
+	if len(ctx.Tools) != 1 {
+		t.Fatalf("expected exactly 1 tool (from req.Tools), got %d", len(ctx.Tools))
+	}
+	if ctx.Tools[0].ToolSpecification.Name != "bash" {
+		t.Fatalf("expected tool name 'bash', got %q", ctx.Tools[0].ToolSpecification.Name)
+	}
+}
+
+func TestCollectHistoryToolsSanitizesNames(t *testing.T) {
+	// Verify that auto-declared tool names go through sanitizeToolName.
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Do something"},
+			{Role: "assistant", Content: []interface{}{
+				map[string]interface{}{"type": "tool_use", "id": "call_1", "name": "mcp__server__long_tool_name", "input": map[string]interface{}{}},
+			}},
+			{Role: "user", Content: []interface{}{
+				map[string]interface{}{"type": "tool_result", "tool_use_id": "call_1", "content": "ok"},
+			}},
+			{Role: "assistant", Content: "Done."},
+			{Role: "user", Content: "Summarize."},
+		},
+		Tools: nil,
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx == nil || len(ctx.Tools) == 0 {
+		t.Fatalf("expected auto-declared tools")
+	}
+
+	// "mcp__server__long_tool_name" should be sanitized (underscores -> camelCase)
+	toolName := ctx.Tools[0].ToolSpecification.Name
+	if strings.Contains(toolName, "_") {
+		t.Fatalf("expected sanitized tool name without underscores, got %q", toolName)
+	}
+
+	// ToolNameMap should map sanitized -> original
+	if payload.ToolNameMap == nil {
+		t.Fatalf("expected ToolNameMap to be set for sanitized names")
+	}
+	if payload.ToolNameMap[toolName] != "mcp__server__long_tool_name" {
+		t.Fatalf("expected ToolNameMap[%q] = 'mcp__server__long_tool_name', got %q", toolName, payload.ToolNameMap[toolName])
+	}
+}
+
+func TestCollectHistoryToolsNoopWhenHistoryHasNoTools(t *testing.T) {
+	// Pure text conversation with no tools in history - should not inject any tools.
+	req := &ClaudeRequest{
+		Model: "claude-sonnet-4.5",
+		Messages: []ClaudeMessage{
+			{Role: "user", Content: "Hello"},
+			{Role: "assistant", Content: "Hi there"},
+			{Role: "user", Content: "How are you?"},
+		},
+		Tools: nil,
+	}
+
+	payload := ClaudeToKiro(req, false)
+
+	ctx := payload.ConversationState.CurrentMessage.UserInputMessage.UserInputMessageContext
+	if ctx != nil && len(ctx.Tools) > 0 {
+		t.Fatalf("expected no tools for pure text conversation, got %d tools", len(ctx.Tools))
+	}
+}
+
 func TestParseModelAndThinkingDoesNotRewriteDatedSnapshotMinor(t *testing.T) {
 	// Guards the \b boundary in claudeVersionPattern: without it, the regex would
 	// rewrite "claude-sonnet-4-20250514" to "claude-sonnet-4.20250514" before the

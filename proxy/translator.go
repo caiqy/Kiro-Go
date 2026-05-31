@@ -265,6 +265,12 @@ func ClaudeToKiro(req *ClaudeRequest, thinking bool) *KiroPayload {
 	// 转换工具
 	kiroTools, toolNameMap := convertClaudeTools(req.Tools)
 
+	// If no tools declared but history contains tool_use, auto-declare them.
+	// Kiro/AmazonQ rejects requests with tool structures in history but no tool definitions.
+	if len(kiroTools) == 0 {
+		kiroTools, toolNameMap = collectHistoryTools(history)
+	}
+
 	// 构建 payload
 	payload := &KiroPayload{}
 	payload.ToolNameMap = toolNameMap
@@ -1254,10 +1260,57 @@ func buildToolResultsContinuation(toolResults []KiroToolResult) string {
 	return joined
 }
 
+func collectHistoryTools(history []KiroHistoryMessage) ([]KiroToolWrapper, map[string]string) {
+	toolNames := make(map[string]bool)
+	for _, msg := range history {
+		if msg.AssistantResponseMessage != nil {
+			for _, tu := range msg.AssistantResponseMessage.ToolUses {
+				if tu.Name != "" {
+					toolNames[tu.Name] = true
+				}
+			}
+		}
+	}
+	if len(toolNames) == 0 {
+		return nil, nil
+	}
+	var tools []KiroToolWrapper
+	var nameMap map[string]string
+	for name := range toolNames {
+		sanitized := shortenToolName(sanitizeToolName(name))
+		w := KiroToolWrapper{}
+		w.ToolSpecification.Name = sanitized
+		w.ToolSpecification.Description = "Tool: " + name
+		w.ToolSpecification.InputSchema = InputSchema{JSON: map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}}
+		tools = append(tools, w)
+		if sanitized != name {
+			if nameMap == nil {
+				nameMap = make(map[string]string)
+			}
+			nameMap[sanitized] = name
+		}
+	}
+	return tools, nameMap
+}
+
 func trimLeadingAssistantHistory(history []KiroHistoryMessage) []KiroHistoryMessage {
 	idx := 0
-	for idx < len(history) && history[idx].AssistantResponseMessage != nil {
-		idx++
+	for idx < len(history) {
+		msg := history[idx]
+		if msg.AssistantResponseMessage != nil {
+			idx++
+			continue
+		}
+		if msg.UserInputMessage != nil {
+			hasText := strings.TrimSpace(msg.UserInputMessage.Content) != ""
+			hasImages := len(msg.UserInputMessage.Images) > 0
+			hasToolResults := msg.UserInputMessage.UserInputMessageContext != nil && len(msg.UserInputMessage.UserInputMessageContext.ToolResults) > 0
+			if !hasText && !hasImages && hasToolResults {
+				idx++
+				continue
+			}
+		}
+		break
 	}
 	if idx == 0 {
 		return history
