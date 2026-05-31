@@ -37,11 +37,99 @@ func TestNormalizeChunkPrefixRewindDoesNotReplay(t *testing.T) {
 	}
 }
 
-func TestNormalizeChunkOverlapDelta(t *testing.T) {
+func TestNormalizeChunkNonCumulativeReturnsFullChunk(t *testing.T) {
 	prev := "hello world"
 
-	if got := normalizeChunk("world!!!", &prev); got != "!!!" {
-		t.Fatalf("expected overlap suffix delta, got %q", got)
+	// 非累积 chunk 应完整返回，不做重叠猜测（避免重复模式误判吞内容）
+	if got := normalizeChunk("world!!!", &prev); got != "world!!!" {
+		t.Fatalf("expected full chunk for non-cumulative input, got %q", got)
+	}
+}
+
+func TestNormalizeChunkMarkdownTableSeparator(t *testing.T) {
+	// 回归测试：markdown 表格分隔行的重复模式不应被吞掉
+	prev := "| # | 域名 | 下载 | 上传 | 总计 | 连接数 |\n|---|------"
+
+	chunk := "|------|------|------|------|\n| 1"
+	got := normalizeChunk(chunk, &prev)
+	if got != chunk {
+		t.Fatalf("expected full chunk (table separator must not be eaten), got %q", got)
+	}
+}
+
+func TestNormalizeChunkExactDuplicate(t *testing.T) {
+	prev := ""
+
+	_ = normalizeChunk("hello world", &prev)
+	// 完全重复的 chunk 应返回空
+	if got := normalizeChunk("hello world", &prev); got != "" {
+		t.Fatalf("expected empty for exact duplicate, got %q", got)
+	}
+}
+
+func TestNormalizeChunkFallbackUpdatesState(t *testing.T) {
+	prev := ""
+
+	_ = normalizeChunk("abc", &prev)
+	// 非累积 chunk（与 prev 无前缀关系）
+	got := normalizeChunk("xyz", &prev)
+	if got != "xyz" {
+		t.Fatalf("expected full chunk on fallback, got %q", got)
+	}
+	// fallback 后 previous 应更新为新 chunk，后续累积增长基于新内容
+	if prev != "xyz" {
+		t.Fatalf("expected previous updated to new chunk, got %q", prev)
+	}
+	if got := normalizeChunk("xyz123", &prev); got != "123" {
+		t.Fatalf("expected normal delta after fallback, got %q", got)
+	}
+}
+
+func TestParseEventStreamAssistantAndReasoningIndependent(t *testing.T) {
+	// assistant 和 reasoning 各自维护独立的 normalize 状态，不互相干扰
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hello"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "think"}),
+		awsEventStreamFrame(t, "assistantResponseEvent", map[string]interface{}{"content": "hello world"}),
+		awsEventStreamFrame(t, "reasoningContentEvent", map[string]interface{}{"text": "thinking"}),
+	}, nil))
+
+	var assistantTexts []string
+	var reasoningTexts []string
+	err := parseEventStream(stream, &KiroStreamCallback{
+		OnText: func(text string, isThinking bool) {
+			if isThinking {
+				reasoningTexts = append(reasoningTexts, text)
+			} else {
+				assistantTexts = append(assistantTexts, text)
+			}
+		},
+		OnComplete: func(_, _ int) {},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// assistant: "hello" -> "hello world" 应产生 "hello" + " world"
+	expectedAssistant := []string{"hello", " world"}
+	if len(assistantTexts) != len(expectedAssistant) {
+		t.Fatalf("assistant texts: expected %v, got %v", expectedAssistant, assistantTexts)
+	}
+	for i, exp := range expectedAssistant {
+		if assistantTexts[i] != exp {
+			t.Fatalf("assistant[%d]: expected %q, got %q", i, exp, assistantTexts[i])
+		}
+	}
+
+	// reasoning: "think" -> "thinking" 应产生 "think" + "ing"
+	expectedReasoning := []string{"think", "ing"}
+	if len(reasoningTexts) != len(expectedReasoning) {
+		t.Fatalf("reasoning texts: expected %v, got %v", expectedReasoning, reasoningTexts)
+	}
+	for i, exp := range expectedReasoning {
+		if reasoningTexts[i] != exp {
+			t.Fatalf("reasoning[%d]: expected %q, got %q", i, exp, reasoningTexts[i])
+		}
 	}
 }
 

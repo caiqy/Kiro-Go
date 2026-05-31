@@ -627,23 +627,11 @@ func normalizeChunk(chunk string, previous *string) string {
 		return ""
 	}
 
-	maxOverlap := 0
-	maxLen := len(prev)
-	if len(chunk) < maxLen {
-		maxLen = len(chunk)
-	}
-	for i := maxLen; i > 0; i-- {
-		if strings.HasSuffix(prev, chunk[:i]) {
-			maxOverlap = i
-			break
-		}
-	}
-
+	// 非累积情况：直接作为全新内容返回。
+	// 不再做重叠检测，避免重复模式（如 markdown 表格分隔行 "------|"）被误判吞掉。
+	// Kiro 正常文本事件按 append-only cumulative snapshot 处理；非前缀内容视为独立 chunk。
+	logger.Debugf("[NormalizeChunk] non-cumulative fallback: prevLen=%d chunkLen=%d", len(prev), len(chunk))
 	*previous = chunk
-	if maxOverlap > 0 {
-		return chunk[maxOverlap:]
-	}
-
 	return chunk
 }
 
