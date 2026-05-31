@@ -779,9 +779,10 @@ func cloneSchemaValue(v interface{}) interface{} {
 	}
 }
 
-// cleanSchema 递归清理会导致 Kiro 400 的 schema 字段。
+// cleanSchema 递归清理会导致 Kiro 400 或空响应的 schema 字段。
 func cleanSchema(m map[string]interface{}) {
 	delete(m, "additionalProperties")
+	delete(m, "$schema")
 
 	// required 必须是非空数组，否则 Kiro 会报 Improperly formed request。
 	if req, exists := m["required"]; exists {
